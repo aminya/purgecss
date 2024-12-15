@@ -7,7 +7,7 @@
  */
 
 import * as fs from "fs";
-import * as glob from "glob";
+import glob from "fast-glob";
 import * as path from "path";
 import * as postcss from "postcss";
 import selectorParser from "postcss-selector-parser";
@@ -443,31 +443,36 @@ class PurgeCSS {
   ): Promise<ExtractorResultSets> {
     const selectors = new ExtractorResultSets([]);
     const filesNames: string[] = [];
-    for (const globFile of files) {
-      try {
-        await asyncFs.access(globFile, fs.constants.F_OK);
-        filesNames.push(globFile);
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      } catch (err) {
-        filesNames.push(
-          ...glob.sync(globFile, {
-            nodir: true,
-            ignore: this.options.skippedContentGlobs.map((glob) =>
-              glob.replace(/^\.\//, ""),
-            ),
-          }),
-        );
-      }
-    }
+    await Promise.all(
+      files.map(async (globFile) => {
+        try {
+          await asyncFs.access(globFile, fs.constants.F_OK);
+          filesNames.push(globFile);
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        } catch (err) {
+          filesNames.push(
+            ...(await glob(globFile, {
+              onlyFiles: true,
+              ignore: this.options.skippedContentGlobs.map((glob) =>
+                glob.replace(/^\.\//, ""),
+              ),
+            })),
+          );
+        }
+      }),
+    );
+
     if (files.length > 0 && filesNames.length === 0) {
       console.warn("No files found from the passed PurgeCSS option 'content'.");
     }
-    for (const file of filesNames) {
-      const content = await asyncFs.readFile(file, "utf-8");
-      const extractor = this.getFileExtractor(file, extractors);
-      const extractedSelectors = await extractSelectors(content, extractor);
-      selectors.merge(extractedSelectors);
-    }
+    await Promise.all(
+      filesNames.map(async (file) => {
+        const content = await asyncFs.readFile(file, "utf-8");
+        const extractor = this.getFileExtractor(file, extractors);
+        const extractedSelectors = await extractSelectors(content, extractor);
+        selectors.merge(extractedSelectors);
+      }),
+    );
     return selectors;
   }
 
@@ -482,11 +487,13 @@ class PurgeCSS {
     extractors: Extractors[],
   ): Promise<ExtractorResultSets> {
     const selectors = new ExtractorResultSets([]);
-    for (const { raw, extension } of content) {
-      const extractor = this.getFileExtractor(`.${extension}`, extractors);
-      const extractedSelectors = await extractSelectors(raw, extractor);
-      selectors.merge(extractedSelectors);
-    }
+    await Promise.all(
+      content.map(async ({ raw, extension }) => {
+        const extractor = this.getFileExtractor(`.${extension}`, extractors);
+        const extractedSelectors = await extractSelectors(raw, extractor);
+        selectors.merge(extractedSelectors);
+      }),
+    );
     return selectors;
   }
 
@@ -637,71 +644,75 @@ class PurgeCSS {
     cssOptions: Array<string | RawCSS>,
     selectors: ExtractorResultSets,
   ): Promise<ResultPurge[]> {
-    const sources = [];
+    const sources: ResultPurge[] = [];
 
     // resolve any globs
     const processedOptions: Array<string | RawCSS> = [];
-    for (const option of cssOptions) {
-      if (typeof option === "string") {
-        processedOptions.push(
-          ...glob.sync(option, {
-            nodir: true,
-            ignore: this.options.skippedContentGlobs,
-          }),
-        );
-      } else {
-        processedOptions.push(option);
-      }
-    }
+    await Promise.all(
+      cssOptions.map(async (option) => {
+        if (typeof option === "string") {
+          processedOptions.push(
+            ...(await glob(option, {
+              onlyFiles: true,
+              ignore: this.options.skippedContentGlobs,
+            })),
+          );
+        } else {
+          processedOptions.push(option);
+        }
+      }),
+    );
 
-    for (const option of processedOptions) {
-      const cssContent =
-        typeof option === "string"
-          ? this.options.stdin
-            ? option
-            : await asyncFs.readFile(option, "utf-8")
-          : option.raw;
-      const isFromFile = typeof option === "string" && !this.options.stdin;
-      const root = postcss.parse(cssContent, {
-        from: isFromFile ? option : undefined,
-      });
+    await Promise.all(
+      processedOptions.map(async (option) => {
+        const cssContent =
+          typeof option === "string"
+            ? this.options.stdin
+              ? option
+              : await asyncFs.readFile(option, "utf-8")
+            : option.raw;
+        const isFromFile = typeof option === "string" && !this.options.stdin;
+        const root = postcss.parse(cssContent, {
+          from: isFromFile ? option : undefined,
+        });
 
-      // purge unused selectors
-      this.walkThroughCSS(root, selectors);
+        // purge unused selectors
+        this.walkThroughCSS(root, selectors);
 
-      if (this.options.fontFace) this.removeUnusedFontFaces();
-      if (this.options.keyframes) this.removeUnusedKeyframes();
-      if (this.options.variables) this.removeUnusedCSSVariables();
+        if (this.options.fontFace) this.removeUnusedFontFaces();
+        if (this.options.keyframes) this.removeUnusedKeyframes();
+        if (this.options.variables) this.removeUnusedCSSVariables();
 
-      const postCSSResult = root.toResult({
-        map: this.options.sourceMap,
-        to:
-          typeof this.options.sourceMap === "object"
-            ? this.options.sourceMap.to
-            : undefined,
-      });
-      const result: ResultPurge = {
-        css: postCSSResult.toString(),
-        file: typeof option === "string" ? option : option.name,
-      };
+        const postCSSResult = root.toResult({
+          map: this.options.sourceMap,
+          to:
+            typeof this.options.sourceMap === "object"
+              ? this.options.sourceMap.to
+              : undefined,
+        });
+        const result: ResultPurge = {
+          css: postCSSResult.toString(),
+          file: typeof option === "string" ? option : option.name,
+        };
 
-      if (this.options.sourceMap) {
-        result.sourceMap = postCSSResult.map?.toString();
-      }
+        if (this.options.sourceMap) {
+          result.sourceMap = postCSSResult.map?.toString();
+        }
 
-      if (this.options.rejected) {
-        result.rejected = Array.from(this.selectorsRemoved);
-        this.selectorsRemoved.clear();
-      }
+        if (this.options.rejected) {
+          result.rejected = Array.from(this.selectorsRemoved);
+          this.selectorsRemoved.clear();
+        }
 
-      if (this.options.rejectedCss) {
-        result.rejectedCss = postcss
-          .root({ nodes: this.removedNodes })
-          .toString();
-      }
+        if (this.options.rejectedCss) {
+          result.rejectedCss = postcss
+            .root({ nodes: this.removedNodes })
+            .toString();
+        }
 
-      sources.push(result);
-    }
+        sources.push(result);
+      }),
+    );
     return sources;
   }
 
